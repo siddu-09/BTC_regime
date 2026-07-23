@@ -1,0 +1,77 @@
+{
+  "split_date": "2025-01-01",
+  "test_end": "2026-07-01",
+  "n_in": 10956,
+  "n_out": 3275,
+  "n_features": 75,
+  "insample_acc": 0.7472,
+  "outsample_acc": 0.4311,
+  "outsample_balanced_acc": 0.4319,
+  "outsample_f1": 0.356,
+  "outsample_logloss": 1.1712,
+  "per_class_auc": {
+    "bearish": 0.5404,
+    "bullish": 0.5787,
+    "chop_calm": 0.9138,
+    "chop_volatile": 0.5948
+  },
+  "overfit_gap": 0.316,
+  "persistence_baseline": 0.5017,
+  "majority_baseline": 0.6379,
+  "markov_baseline": 0.6379,
+  "lift_over_majority": -0.2067,
+  "lift_over_markov": -0.2067,
+  "lift_over_persistence": -0.0705,
+  "raw_acc": 0.4311,
+  "filtered_acc": 0.542,
+  "filter_active": false,
+  "transition_metrics": {
+    "n_transitions": 1632,
+    "n_persistence": 1643,
+    "acc_transitions": 0.3119,
+    "acc_persistence": 0.5496,
+    "detect_recall": 0.5147,
+    "detect_precision": 0.5316,
+    "detect_f1": 0.523,
+    "target_accuracy": 0.606
+  },
+  "per_class": {
+    "bearish": {
+      "precision": 0.1695501730103806,
+      "recall": 0.21166306695464362,
+      "f1-score": 0.1882804995196926,
+      "support": 463.0
+    },
+    "bullish": {
+      "precision": 0.18701700154559506,
+      "recall": 0.25313807531380755,
+      "f1-score": 0.21511111111111111,
+      "support": 478.0
+    },
+    "chop_calm": {
+      "precision": 0.32053422370617696,
+      "recall": 0.7836734693877551,
+      "f1-score": 0.4549763033175355,
+      "support": 245.0
+    },
+    "chop_volatile": {
+      "precision": 0.6898690558235699,
+      "recall": 0.47917663954045,
+      "f1-score": 0.5655367231638418,
+      "support": 2089.0
+    },
+    "accuracy": 0.4311450381679389,
+    "macro avg": {
+      "precision": 0.34174261352143065,
+      "recall": 0.43191281279916405,
+      "f1-score": 0.35597615927804527,
+      "support": 3275.0
+    },
+    "weighted avg": {
+      "precision": 0.5152864730583364,
+      "recall": 0.4311450381679389,
+      "f1-score": 0.45278546302008876,
+      "support": 3275.0
+    }
+  }
+}

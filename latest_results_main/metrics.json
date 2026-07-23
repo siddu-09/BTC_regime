@@ -1,0 +1,22 @@
+{
+  "n_train": 10956,
+  "n_features": 74,
+  "n_estimators": 265,
+  "insample_acc": 0.4622,
+  "insample_f1": 0.399,
+  "persistence_baseline": 0.3304,
+  "xgb_params": {
+    "max_depth": 4,
+    "learning_rate": 0.02,
+    "subsample": 0.8,
+    "colsample_bytree": 0.7,
+    "min_child_weight": 30,
+    "reg_lambda": 3.0,
+    "reg_alpha": 0.5,
+    "objective": "multi:softprob",
+    "eval_metric": "mlogloss",
+    "tree_method": "hist",
+    "random_state": 42,
+    "n_estimators": 265
+  }
+}

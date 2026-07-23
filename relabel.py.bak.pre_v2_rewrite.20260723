@@ -1,0 +1,177 @@
+"""
+relabel.py — Multi-TF verified regime labeling (NO hysteresis)
+
+Labels each 4hr block by cross-checking 30min + 2hr + 4hr candles:
+
+  Step 1: Dead-block test → chop_calm (strict: range<0.50%, vol<80%, tiny 30m bodies)
+  Step 2: Compute direction + strength on 30min (8 candles) and 2hr (2 candles)
+  Step 3: If all TFs agree AND efficiency>=0.35 AND |net|>=0.24% → bullish/bearish
+  Step 4: If TFs disagree → strength-weighted vote decides; no winner → chop_volatile
+  Step 5: Energetic but below threshold → chop_volatile (borderline: eff>=0.30 + TF agree → directional)
+
+Usage:
+    DATA_1MIN_CSV=BTC_IST.csv python relabel.py
+"""
+import os
+import numpy as np
+import pandas as pd
+
+DATA_1MIN_CSV = os.environ.get("DATA_1MIN_CSV", "BTC_IST.csv")
+OUTPUT_PATH   = os.environ.get("LABELS_CSV", "labels.csv")
+
+BLOCK_HOURS = {
+    "00-04": (0, 4),  "04-08": (4, 8),   "08-12": (8, 12),
+    "12-16": (12, 16), "16-20": (16, 20), "20-00": (20, 24),
+}
+
+# Thresholds calibrated from TradingView chart examples
+EFF_TH   = 0.35      # |close-open|/range for directional
+NET_TH   = 0.0024    # |close-open|/open for meaningful move (0.24%)
+CALM_RNG = 0.0050    # range/price < 0.50% for calm (strict — only dead blocks)
+CALM_VOL = 0.80      # volume < 80% of 90-day median
+VOL_WIN  = 540       # rolling window for volume baseline (~90 days of 4h blocks)
+
+
+def assign_block(dt):
+    h = dt.hour
+    for label, (s, e) in BLOCK_HOURS.items():
+        if s <= h < e: return label
+    return "20-00"
+
+
+def resample(df, rule):
+    return df.resample(rule, origin='start_day').agg({
+        'open':'first','high':'max','low':'min','close':'last','volume':'sum'
+    }).dropna(subset=['open'])
+
+
+def tf_control(o, h, l, c):
+    """
+    Compute direction and control strength for a set of candles.
+    Returns (direction, strength):
+      direction: +1 bullish, -1 bearish, 0 none
+      strength: 0-1, how one-sided the control was
+    """
+    n = len(c)
+    if n < 1: return 0, 0.0
+    net = c[-1] - o[0]; rng = h.max() - l.min()
+    if rng <= 0: return 0, 0.0
+    bull = int((c > o).sum()); bear = int((c < o).sum())
+    bodies = np.abs(c - o)
+    bb = bodies[c > o].sum(); brb = bodies[c < o].sum(); tb = bb + brb
+    eff = abs(net) / rng
+    bd = (bb - brb) / tb if tb > 0 else 0
+    cd = (bull - bear) / n if n > 0 else 0
+    return int(np.sign(net)), float(eff * (abs(bd)*0.5 + abs(cd)*0.5))
+
+
+def classify_block(b30, b2h, row, vol_ratio):
+    """Classify a single 4h block using multi-TF cross-check."""
+    o4, h4, l4, c4 = row['open'], row['high'], row['low'], row['close']
+    net = c4 - o4; rng = h4 - l4; price = o4 if o4 > 0 else 1
+    net_ret = net / price; rng_pct = rng / price
+    eff = abs(net) / rng if rng > 0 else 0
+
+    # Average 30min body size (for calm test)
+    if len(b30) > 0:
+        avg_body_pct = np.mean(np.abs(b30['close'].values - b30['open'].values)) / price
+    else:
+        avg_body_pct = rng_pct
+
+    # Step 1: Dead-block test (strict calm)
+    if rng_pct < CALM_RNG and vol_ratio < CALM_VOL and avg_body_pct < CALM_RNG * 0.3:
+        return 'chop_calm'
+
+    # Step 2: Multi-TF direction + strength
+    if len(b30) >= 2:
+        d30, s30 = tf_control(b30['open'].values, b30['high'].values,
+                              b30['low'].values, b30['close'].values)
+    else:
+        d30, s30 = int(np.sign(net)), eff
+
+    if len(b2h) >= 1:
+        d2h, s2h = tf_control(b2h['open'].values, b2h['high'].values,
+                              b2h['low'].values, b2h['close'].values)
+    else:
+        d2h, s2h = int(np.sign(net)), eff
+
+    d4h = int(np.sign(net))
+    directional = (eff >= EFF_TH and abs(net_ret) >= NET_TH)
+    tfs_agree = (d30 == d2h == d4h) and d4h != 0
+
+    # Step 3: All TFs agree + directional → confident label
+    if directional and tfs_agree:
+        return 'bullish' if net > 0 else 'bearish'
+
+    # Step 4: Directional but TFs disagree → strength-weighted vote
+    if directional and not tfs_agree:
+        votes = d30*s30 + d2h*s2h + d4h*eff
+        if abs(votes) > 0.15:
+            return 'bullish' if votes > 0 else 'bearish'
+        return 'chop_volatile'
+
+    # Step 5: Not directional but energetic → chop_volatile
+    energetic = (rng_pct >= CALM_RNG or vol_ratio >= CALM_VOL or
+                 avg_body_pct >= CALM_RNG * 0.3)
+    if energetic:
+        # Borderline: efficiency close + TFs agree → still directional
+        if eff >= 0.30 and abs(net_ret) >= NET_TH and tfs_agree:
+            return 'bullish' if net > 0 else 'bearish'
+        return 'chop_volatile'
+
+    return 'chop_calm'
+
+
+def main():
+    print("=" * 62)
+    print(" RELABEL — Multi-TF verified regime labels")
+    print("=" * 62)
+
+    df = pd.read_csv(DATA_1MIN_CSV,
+                     usecols=['open_time','open','high','low','close','volume'])
+    df['open_time'] = pd.to_datetime(df['open_time'])
+    df = df.set_index('open_time').sort_index()
+    df = df[~df.index.duplicated(keep='first')]
+    for col in ['open','high','low','close','volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    print(f"  {len(df):,} 1min candles")
+
+    df30 = resample(df, '30min')
+    df2h = resample(df, '2h')
+    df4h = resample(df, '4h')
+    print(f"  30m: {len(df30):,}  2h: {len(df2h):,}  4h: {len(df4h):,}")
+
+    for d in (df30, df2h, df4h):
+        d['block_id'] = d.index.strftime('%Y-%m-%d') + '_' + d.index.map(assign_block)
+
+    vol_med = df4h['volume'].rolling(VOL_WIN, min_periods=30).median()
+    df4h['vol_ratio'] = (df4h['volume'] / vol_med).fillna(1.0)
+
+    g30 = {bid: g for bid, g in df30.groupby('block_id', sort=False)}
+    g2h = {bid: g for bid, g in df2h.groupby('block_id', sort=False)}
+
+    print("  Classifying with multi-TF cross-check ...")
+    labels = []
+    for idx, row in df4h.iterrows():
+        bid = row['block_id']
+        b30 = g30.get(bid, pd.DataFrame(columns=['open','high','low','close','volume']))
+        b2h = g2h.get(bid, pd.DataFrame(columns=['open','high','low','close','volume']))
+        regime = classify_block(b30, b2h, row, row['vol_ratio'])
+        labels.append({'date': idx.strftime('%Y-%m-%d'),
+                       'block': assign_block(idx), 'regime': regime})
+
+    out = pd.DataFrame(labels)
+    out.to_csv(OUTPUT_PATH, index=False)
+    print(f"\n  Saved -> {OUTPUT_PATH}  ({len(out):,} blocks)")
+
+    vc = out['regime'].value_counts()
+    print(f"\n  Distribution:")
+    for r in ['bullish', 'bearish', 'chop_volatile', 'chop_calm']:
+        n = vc.get(r, 0); pct = n / len(out) * 100
+        print(f"    {r:15s} {n:5,d} ({pct:4.1f}%)")
+
+    print("=" * 62)
+
+
+if __name__ == '__main__':
+    main()

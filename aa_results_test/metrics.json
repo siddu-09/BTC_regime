@@ -1,0 +1,64 @@
+{
+  "split_date": "2025-01-01",
+  "test_end": "2026-07-01",
+  "n_in": 10956,
+  "n_out": 3275,
+  "n_features": 74,
+  "insample_acc": 0.4622,
+  "outsample_acc": 0.3685,
+  "outsample_f1": 0.291,
+  "outsample_logloss": 1.1977,
+  "overfit_gap": 0.0937,
+  "persistence_baseline": 0.3295,
+  "majority_baseline": 0.3481,
+  "lift": 0.0391,
+  "transition_metrics": {
+    "n_transitions": 2196,
+    "n_persistence": 1079,
+    "acc_transitions": 0.321,
+    "acc_persistence": 0.4652,
+    "detect_recall": 0.6457,
+    "detect_precision": 0.7108,
+    "detect_f1": 0.6767,
+    "target_accuracy": 0.4972
+  },
+  "per_class": {
+    "bearish": {
+      "precision": 0.3333333333333333,
+      "recall": 0.02287581699346405,
+      "f1-score": 0.04281345565749235,
+      "support": 918.0
+    },
+    "bullish": {
+      "precision": 0.2523809523809524,
+      "recall": 0.058823529411764705,
+      "f1-score": 0.09540954095409541,
+      "support": 901.0
+    },
+    "chop_calm": {
+      "precision": 0.4888268156424581,
+      "recall": 0.5537974683544303,
+      "f1-score": 0.5192878338278932,
+      "support": 316.0
+    },
+    "chop_volatile": {
+      "precision": 0.36232980332829046,
+      "recall": 0.8403508771929824,
+      "f1-score": 0.5063424947145877,
+      "support": 1140.0
+    },
+    "accuracy": 0.3685496183206107,
+    "macro avg": {
+      "precision": 0.3592177261712586,
+      "recall": 0.3689619229881604,
+      "f1-score": 0.29096333128851715,
+      "support": 3275.0
+    },
+    "weighted avg": {
+      "precision": 0.3361589275213758,
+      "recall": 0.3685496183206106,
+      "f1-score": 0.26460828951372894,
+      "support": 3275.0
+    }
+  }
+}

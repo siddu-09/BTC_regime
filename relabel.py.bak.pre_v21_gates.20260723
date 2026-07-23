@@ -1,0 +1,461 @@
+"""
+relabel.py - High-precision multi-timeframe regime labeling for BTCUSDT 4h blocks.
+
+PURPOSE
+-------
+Produce clean, stable, economically meaningful labels so that XGBoost learns
+persistent market structure instead of single-candle noise. The label answers
+"who controls this market?" rather than "what did this one candle do?".
+
+Design targets, in priority order:
+  1. HIGH PRECISION on directional labels. A missed weak trend costs little;
+     a false trend teaches the model a pattern that does not exist.
+  2. LOW transition frequency, achieved by raising the evidence bar - never by
+     blindly repeating the previous label.
+  3. ZERO lag on genuine reversals. A high-conviction flip is labelled on the
+     exact block it occurs, with memory fully bypassed.
+
+WHAT CHANGED FROM v1
+--------------------
+(1) CRITICAL BUG FIX - the multi-timeframe check was inoperative.
+    v1's tf_control() derived direction from `net = c[-1] - o[0]`. For every
+    sub-timeframe of a block that equals (block close - block open), so the
+    30m, 2h and 4h "directions" were the same number computed three times.
+    Measured: d30 != d4h on 0 of 14,232 blocks. `tfs_agree` was therefore
+    always True and the Step-4 weighted vote was unreachable dead code.
+    FIX: each timeframe now derives direction from its INTERNAL candle
+    structure (body dominance + candle-count dominance), so the timeframes are
+    genuinely independent witnesses and agreement carries information.
+
+(2) Timeframe ladder 30m/2h/4h -> 15m/1h/2h/4h. 15m catches impulse onset,
+    1h/2h carry structure, 4h confirms net displacement.
+
+(3) Memory over the previous 3 labels, as a Bayesian-style prior that adjusts
+    the evidence THRESHOLD. It never assigns a label on its own.
+
+(4) Directional thresholds raised (efficiency 0.30 -> 0.45, net 0.24% -> 0.35%)
+    to cut false trend labels.
+
+(5) Path efficiency added as a second, orthogonal quality gate.
+
+HARD INVARIANT
+--------------
+A directional label's SIGN always equals sign(block close - block open).
+Memory and multi-timeframe evidence decide WHETHER a block is directional,
+never WHICH WAY. This keeps every label factually true of its own block: a
+block that closed down can never be labelled bullish.
+
+CAUSALITY
+---------
+Every input is available at the block's close. Memory reads only already-
+assigned previous labels. The volume baseline is a trailing rolling median
+(pandas rolling is right-aligned). No future data enters any label.
+
+KNOWN TRADE-OFF - READ BEFORE TRUSTING DOWNSTREAM ACCURACY
+----------------------------------------------------------
+Because label(t) depends on label(t-1..t-3), predicting label(t+1) is partly
+the task of predicting a recursion whose inputs are already known. Transition
+counts will fall and model accuracy will rise - but the PERSISTENCE BASELINE
+rises too. The win condition is not "fewer transitions"; it is EXCESS
+PERSISTENCE (observed persistence minus what independent draws at the same
+class balance would give). main() prints that number. If transitions fall and
+excess persistence does not rise, the labels only became stickier, not more
+informative.
+
+Usage:
+    DATA_1MIN_CSV=BTC_IST.csv LABELS_CSV=labels.csv python relabel.py
+"""
+import os
+import numpy as np
+import pandas as pd
+
+DATA_1MIN_CSV = os.environ.get("DATA_1MIN_CSV", "BTC_IST.csv")
+OUTPUT_PATH = os.environ.get("LABELS_CSV", "labels.csv")
+COMPARE_TO = os.environ.get("COMPARE_TO", "final_labels.csv")
+
+BLOCK_HOURS = {
+    "00-04": (0, 4), "04-08": (4, 8), "08-12": (8, 12),
+    "12-16": (12, 16), "16-20": (16, 20), "20-00": (20, 24),
+}
+
+# ============================================================================
+# CONFIGURATION - every value justified
+# ============================================================================
+
+# --- Timeframe weights within CURRENT evidence (must sum to 1.0) ------------
+# 2h carries the most weight: two 2h candles split the block in half, the
+# coarsest view that still exposes internal structure, so it best answers "did
+# control hold across the whole block". 4h is a single candle - it sees net
+# displacement but no path, so it confirms rather than decides. 15m is the
+# noisiest, hence the smallest weight, but it is the only view that can detect
+# an impulse beginning mid-block.
+TF_WEIGHTS = {"15m": 0.15, "1h": 0.25, "2h": 0.35, "4h": 0.25}
+
+# --- Current evidence vs memory --------------------------------------------
+# 78/22 as specified. Why this is safe: at 22%, memory shifts the effective
+# efficiency requirement by at most INERTIA_MAX (0.10), i.e. 0.45 -> 0.55. That
+# is enough to reject a marginal counter-trend block, and never enough to
+# reject a genuine reversal, which clears EFF_HIGH = 0.60 by definition.
+W_CURRENT = 0.78
+W_MEMORY = 0.22
+
+# --- Memory decay over the previous 3 labels (must sum to 1.0) -------------
+# Three blocks = 12 hours: long enough to represent "the recent state", short
+# enough not to drag a stale regime across a full session.
+MEMORY_WEIGHTS = (0.50, 0.30, 0.20)
+
+# --- Directional thresholds -------------------------------------------------
+# EFF_DIR 0.45 (v1 effective: 0.30). Efficiency is |net| / range. At 0.30 a
+# block that retraced two thirds of its range still qualified as a trend - the
+# single largest source of false trend labels. 0.45 requires the close to hold
+# nearly half the range: a visibly directional bar.
+EFF_DIR = 0.45
+# Borderline tier, reachable only on full structural agreement - a far stronger
+# condition now that the four timeframes are independent.
+EFF_BORDERLINE = 0.40
+# High conviction. ~80th percentile of BTC 4h block efficiency, so it selects
+# the clearly-trending tail rather than the middle of the distribution.
+EFF_HIGH = 0.60
+
+# NET_MIN 0.35% (v1: 0.24%) - filters moves too small to be economically
+# meaningful against typical 4-9 bp round-trip costs.
+NET_MIN = 0.0035
+NET_HIGH = 0.0080          # high-conviction move, ~2.3x the minimum
+
+# Vote thresholds applied to the blended score, which lives in [-1, +1].
+VOTE_TH = 0.30
+VOTE_HIGH = 0.70
+
+# --- Calm (dead block) ------------------------------------------------------
+CALM_RANGE = 0.0045        # 0.45% of price
+CALM_VOL = 0.85            # volume below 85% of trailing baseline
+CALM_BODY_FRAC = 0.30      # avg sub-candle body < 30% of CALM_RANGE = 0.135%
+
+# --- Quality gate -----------------------------------------------------------
+# Path efficiency = |net| / distance walked by the 15m closes. Orthogonal to
+# efficiency (which normalises by range, not by path length): it separates
+# "walked there" from "zigzagged there". 0.25 rejects blocks that travelled
+# more than 4x their net displacement.
+PATH_EFF_MIN = 0.25
+
+# --- Conditional inertia ----------------------------------------------------
+# Memory raises the efficiency bar when the block OPPOSES the remembered
+# regime, scaled by memory strength. It never forces continuation and never
+# assigns a label by itself.
+INERTIA_MAX = 0.10         # max extra efficiency demanded of a reversal
+CONT_DISCOUNT = 0.02       # small bar reduction when the block AGREES
+
+# --- High-conviction override ----------------------------------------------
+# All conditions must hold. When they do, memory is bypassed entirely and the
+# block is labelled on the spot. Deliberately strict: this path exists to
+# guarantee zero lag on real reversals, not to add trend labels.
+HC_VOL_RATIO = 1.50
+
+VOL_WIN = 540              # ~90 days of 4h blocks, trailing
+REGIMES = ['bearish', 'bullish', 'chop_calm', 'chop_volatile']
+DIR_VALUE = {'bullish': 1.0, 'bearish': -1.0, 'chop_calm': 0.0,
+             'chop_volatile': 0.0}
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+def assign_block(dt):
+    h = dt.hour
+    for label, (s, e) in BLOCK_HOURS.items():
+        if s <= h < e:
+            return label
+    return "20-00"
+
+
+def resample(df, rule):
+    return df.resample(rule, origin='start_day').agg({
+        'open': 'first', 'high': 'max', 'low': 'min',
+        'close': 'last', 'volume': 'sum'
+    }).dropna(subset=['open'])
+
+
+def _safe(n, d, fallback=0.0):
+    return n / d if d else fallback
+
+
+def tf_control(o, h, l, c):
+    """Direction and control strength for one timeframe's candles.
+
+    Returns (direction, strength):
+      direction: +1 / -1 / 0, from the INTERNAL structure of the candles -
+                 which side owned more body, and more candles.
+      strength : [0, 1], how one-sided that control was, scaled by how
+                 efficiently price actually travelled.
+
+    THIS IS THE v1 BUG FIX. v1 returned sign(c[-1] - o[0]), which is identical
+    across every sub-timeframe of the same block, making multi-timeframe
+    agreement vacuous. Deriving direction from body and count dominance makes
+    each timeframe an independent witness.
+
+    For a single candle (the 4h view) body_dom and count_dom both collapse to
+    sign(net) and strength reduces to efficiency - exactly the confirming role
+    the 4h timeframe is meant to play.
+    """
+    n = len(c)
+    if n < 1:
+        return 0, 0.0
+    rng = h.max() - l.min()
+    if rng <= 0:
+        return 0, 0.0
+
+    bodies = c - o                                   # signed
+    bull_body = bodies[bodies > 0].sum()
+    bear_body = -bodies[bodies < 0].sum()
+    total_body = bull_body + bear_body
+
+    body_dom = _safe(bull_body - bear_body, total_body)          # [-1, +1]
+    count_dom = (int((c > o).sum()) - int((c < o).sum())) / n    # [-1, +1]
+
+    # 0.6/0.4 favours body over count: three tiny green candles should not
+    # outvote one large red one.
+    composite = 0.6 * body_dom + 0.4 * count_dom
+    direction = int(np.sign(composite))
+
+    efficiency = abs(c[-1] - o[0]) / rng
+    strength = float(efficiency * (0.5 * abs(body_dom) + 0.5 * abs(count_dom)))
+    return direction, min(strength, 1.0)
+
+
+def block_quality(o15, h15, l15, c15):
+    """Orthogonal price-action measures used to reject false trends.
+
+    Deliberately few, each independently explainable:
+      path_eff    - |net| / distance walked. Low = zigzag.
+      overlap     - mean overlap of consecutive candles. High = rotation.
+      persistence - share of total movement in the net direction.
+      wick_imb    - rejection asymmetry. Diagnostic only, not a gate.
+    """
+    net = c15[-1] - o15[0]
+    steps = np.abs(np.diff(c15))
+    path_eff = _safe(abs(net), steps.sum())
+
+    ov = []
+    for i in range(1, len(c15)):
+        lo = max(l15[i], l15[i - 1])
+        hi = min(h15[i], h15[i - 1])
+        union = max(h15[i], h15[i - 1]) - min(l15[i], l15[i - 1])
+        ov.append(_safe(max(0.0, hi - lo), union))
+    overlap = float(np.mean(ov)) if ov else 0.0
+
+    rets = np.diff(c15)
+    if net != 0 and np.abs(rets).sum() > 0:
+        persistence = float(
+            np.abs(rets[np.sign(rets) == np.sign(net)]).sum() / np.abs(rets).sum())
+    else:
+        persistence = 0.5
+
+    up_w = (h15 - np.maximum(o15, c15)).sum()
+    dn_w = (np.minimum(o15, c15) - l15).sum()
+    wick_imb = _safe(abs(up_w - dn_w), up_w + dn_w)
+
+    return {'path_eff': path_eff, 'overlap': overlap,
+            'persistence': persistence, 'wick_imbalance': wick_imb}
+
+
+# ============================================================================
+# CLASSIFIER
+# ============================================================================
+def classify(sub, row4h, vol_ratio, memory_score):
+    """Label one 4h block. `sub` holds the 15m / 1h / 2h candle groups.
+
+    Decision order:
+      1. dead-block test           -> chop_calm
+      2. per-timeframe control     -> weighted current evidence score
+      3. high-conviction override  -> flip now, memory bypassed
+      4. memory-adjusted threshold -> directional or chop_volatile
+    """
+    o4, h4, l4, c4 = row4h['open'], row4h['high'], row4h['low'], row4h['close']
+    price = o4 if o4 > 0 else 1.0
+    net = c4 - o4
+    rng = h4 - l4
+    net_ret = net / price
+    rng_pct = rng / price
+    eff4 = _safe(abs(net), rng)
+
+    g15 = sub['15m']
+    o15, h15, l15, c15 = (g15['open'].values, g15['high'].values,
+                          g15['low'].values, g15['close'].values)
+    avg_body_pct = _safe(np.mean(np.abs(c15 - o15)), price) if len(c15) else rng_pct
+
+    # ---- 1. dead block ----------------------------------------------------
+    if (rng_pct < CALM_RANGE and vol_ratio < CALM_VOL
+            and avg_body_pct < CALM_RANGE * CALM_BODY_FRAC):
+        return 'chop_calm', {'reason': 'calm', 'eff': eff4, 'vote': 0.0}
+
+    # ---- 2. current evidence ---------------------------------------------
+    dirs, strengths = {}, {}
+    for tf in ('15m', '1h', '2h'):
+        g = sub[tf]
+        if len(g) >= 1:
+            dirs[tf], strengths[tf] = tf_control(
+                g['open'].values, g['high'].values,
+                g['low'].values, g['close'].values)
+        else:
+            dirs[tf], strengths[tf] = 0, 0.0
+    dirs['4h'], strengths['4h'] = tf_control(
+        np.array([o4]), np.array([h4]), np.array([l4]), np.array([c4]))
+
+    current = sum(TF_WEIGHTS[tf] * dirs[tf] * strengths[tf] for tf in TF_WEIGHTS)
+    all_agree = (len({dirs[tf] for tf in dirs}) == 1 and dirs['4h'] != 0)
+
+    q = block_quality(o15, h15, l15, c15)
+
+    # Blended score. Memory nudges the score, but the LABEL DIRECTION is always
+    # sign(net) - see the hard invariant in the module docstring.
+    blended = W_CURRENT * current + W_MEMORY * memory_score
+    net_dir = int(np.sign(net))
+    diag = {'eff': eff4, 'vote': blended, 'current': current,
+            'memory': memory_score, 'all_agree': all_agree, **q}
+
+    if net_dir == 0:
+        diag['reason'] = 'flat'
+        return 'chop_volatile', diag
+
+    # ---- 3. high-conviction override -------------------------------------
+    # Every condition must hold. Memory is bypassed entirely: this is the path
+    # that guarantees a real reversal is labelled on the block it happens.
+    if (all_agree and eff4 >= EFF_HIGH and abs(blended) >= VOTE_HIGH
+            and vol_ratio >= HC_VOL_RATIO and abs(net_ret) >= NET_HIGH
+            and q['path_eff'] >= PATH_EFF_MIN):
+        diag['reason'] = 'high_conviction'
+        return ('bullish' if net_dir > 0 else 'bearish'), diag
+
+    # ---- 4. memory-adjusted directional test ------------------------------
+    # Conditional inertia: opposing the remembered regime costs extra
+    # efficiency, proportional to how strong that memory is. Agreeing earns a
+    # small discount. Memory never labels anything by itself - if the evidence
+    # fails, the block becomes chop_volatile, NOT a repeat of the last regime.
+    opposes = (memory_score != 0 and np.sign(memory_score) != net_dir)
+    if opposes:
+        required_eff = EFF_DIR + INERTIA_MAX * abs(memory_score)
+    else:
+        required_eff = EFF_DIR - CONT_DISCOUNT * abs(memory_score)
+
+    # Borderline tier: a lower bar, earned only by full structural agreement
+    # across four now-independent timeframes. The inertia penalty still applies.
+    if all_agree:
+        floor = EFF_BORDERLINE + (INERTIA_MAX * abs(memory_score) if opposes else 0.0)
+        required_eff = min(required_eff, floor)
+
+    directional = (eff4 >= required_eff
+                   and abs(net_ret) >= NET_MIN
+                   and abs(blended) >= VOTE_TH
+                   and np.sign(blended) == net_dir
+                   and q['path_eff'] >= PATH_EFF_MIN)
+
+    diag['required_eff'] = required_eff
+    if directional:
+        diag['reason'] = 'directional'
+        return ('bullish' if net_dir > 0 else 'bearish'), diag
+
+    diag['reason'] = 'no_control'
+    return 'chop_volatile', diag
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+def main():
+    print("=" * 74)
+    print("  RELABEL v2 - high-precision multi-TF regime labels")
+    print("=" * 74)
+
+    df = pd.read_csv(DATA_1MIN_CSV,
+                     usecols=['open_time', 'open', 'high', 'low', 'close', 'volume'])
+    df['open_time'] = pd.to_datetime(df['open_time'])
+    df = df.set_index('open_time').sort_index()
+    df = df[~df.index.duplicated(keep='first')]
+    for c in ['open', 'high', 'low', 'close', 'volume']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    print(f"  {len(df):,} 1min candles")
+
+    tfs = {'15m': resample(df, '15min'), '1h': resample(df, '1h'),
+           '2h': resample(df, '2h'), '4h': resample(df, '4h')}
+    for k, d in tfs.items():
+        d['block_id'] = (d.index.strftime('%Y-%m-%d') + '_' +
+                         d.index.map(assign_block))
+    print("  " + "  ".join(f"{k}:{len(v):,}" for k, v in tfs.items()))
+
+    df4h = tfs['4h']
+    vol_med = df4h['volume'].rolling(VOL_WIN, min_periods=30).median()
+    df4h['vol_ratio'] = (df4h['volume'] / vol_med).fillna(1.0)
+
+    groups = {tf: {b: g for b, g in tfs[tf].groupby('block_id', sort=False)}
+              for tf in ('15m', '1h', '2h')}
+    empty = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+
+    print("  Labelling sequentially (memory needs prior labels) ...")
+    labels, reasons, hist = [], [], []
+    for idx, row in df4h.iterrows():
+        bid = row['block_id']
+        sub = {tf: groups[tf].get(bid, empty) for tf in ('15m', '1h', '2h')}
+        if len(sub['15m']) < 4:
+            regime, diag = 'chop_volatile', {'reason': 'insufficient_data'}
+        else:
+            # hist[-1] is the most recent block -> gets MEMORY_WEIGHTS[0]
+            recent = list(reversed(hist[-3:]))
+            memory = sum(w * v for w, v in zip(MEMORY_WEIGHTS, recent))
+            regime, diag = classify(sub, row, row['vol_ratio'], memory)
+        labels.append({'date': idx.strftime('%Y-%m-%d'),
+                       'block': assign_block(idx), 'regime': regime})
+        reasons.append(diag.get('reason', '?'))
+        hist.append(DIR_VALUE[regime])
+
+    out = pd.DataFrame(labels)
+    out.to_csv(OUTPUT_PATH, index=False)
+    print(f"\n  Saved -> {OUTPUT_PATH}  ({len(out):,} blocks)")
+
+    # ---- diagnostics ------------------------------------------------------
+    r = out.regime.values
+    print("\n  Distribution:")
+    vc = out.regime.value_counts()
+    for k in REGIMES:
+        print(f"    {k:15s} {vc.get(k,0):6,d} ({vc.get(k,0)/len(out)*100:5.1f}%)")
+
+    print("\n  Decision path taken:")
+    for k, v in pd.Series(reasons).value_counts().items():
+        print(f"    {k:22s} {v:6,d} ({v/len(reasons)*100:5.1f}%)")
+
+    trans = (r[:-1] != r[1:]).mean()
+    p = out.regime.value_counts(normalize=True)
+    indep = (p ** 2).sum()
+    flips = sum(1 for i in range(1, len(r) - 1)
+                if r[i] != r[i - 1] and r[i + 1] == r[i - 1])
+    print(f"\n  Transition rate       {trans*100:5.1f}%")
+    print(f"  Persistence           {(1-trans)*100:5.1f}%")
+    print(f"  If independent        {indep*100:5.1f}%")
+    print(f"  EXCESS persistence    {((1-trans)-indep)*100:+5.1f} pp"
+          "   <- THE number that matters")
+    print(f"  One-block round trips {flips:6,d} ({flips/len(r)*100:.1f}%)")
+
+    if os.path.exists(COMPARE_TO):
+        old = pd.read_csv(COMPARE_TO)
+        m = old.merge(out, on=['date', 'block'], suffixes=('_old', '_new'))
+        ro, rn = m.regime_old.values, m.regime_new.values
+        to = (ro[:-1] != ro[1:]).mean()
+        po = old.regime.value_counts(normalize=True)
+        fo = sum(1 for i in range(1, len(ro) - 1)
+                 if ro[i] != ro[i - 1] and ro[i + 1] == ro[i - 1])
+        print(f"\n  vs {COMPARE_TO}:")
+        print(f"    agreement           {(ro==rn).mean()*100:5.1f}%")
+        print(f"    transitions    old {to*100:5.1f}%  ->  new {trans*100:5.1f}%")
+        print(f"    excess persist old {((1-to)-(po**2).sum())*100:+5.1f} pp"
+              f"  ->  new {((1-trans)-indep)*100:+5.1f} pp")
+        print(f"    1-block flips  old {fo:6,d}  ->  new {flips:6,d}")
+
+    print("\n  READ THIS: fewer transitions is NOT the win condition. Excess")
+    print("  persistence is. If transitions fall but excess persistence does")
+    print("  not rise, the labels only became stickier, not more informative,")
+    print("  and the persistence baseline the model must beat rose by exactly")
+    print("  as much as its accuracy will.")
+    print("=" * 74)
+
+
+if __name__ == '__main__':
+    main()
