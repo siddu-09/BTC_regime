@@ -1,0 +1,1027 @@
+# """
+# test.py — Evaluate frozen model on out-of-sample data
+
+# Loads the model trained by main.py, predicts 2025-01-01 → 2026-07-01.
+# No HMM, no retraining, no gimmicks. Just load → predict → measure.
+
+# Reports:
+#     Overall accuracy, F1, log-loss
+#     Overfit gap (in-sample vs out-of-sample)
+#     Per-class precision/recall
+#     Confusion matrix
+#     Transition analysis
+#     Monthly accuracy (decay check)
+#     Confidence calibration
+
+# Usage:
+#     python test.py
+#     FEATURES_CSV=features.csv MODEL_DIR=results_main python test.py
+# """
+# import os, json
+# from pathlib import Path
+
+# import numpy as np
+# import pandas as pd
+# import xgboost as xgb
+# from sklearn.preprocessing import LabelEncoder
+# from sklearn.metrics import (accuracy_score, log_loss, f1_score,
+#                              classification_report, confusion_matrix)
+# import matplotlib; matplotlib.use("Agg")
+# import matplotlib.pyplot as plt
+# import seaborn as sns
+
+# # ============================================================================
+# # CONFIG
+# # ============================================================================
+# FEATURES_CSV = os.environ.get("FEATURES_CSV", "fz_features.csv")
+# MODEL_DIR    = Path(os.environ.get("MODEL_DIR", "kresults_main"))
+# SPLIT_DATE   = os.environ.get("SPLIT_DATE", "2025-01-01")
+# TEST_END     = os.environ.get("TEST_END", "2026-07-01")
+# OUT          = Path(os.environ.get("OUT", "fz_results_test"))
+# OUT.mkdir(parents=True, exist_ok=True)
+
+# REGIMES = ['bearish', 'bullish', 'chop_calm', 'chop_volatile']
+
+# # Must match main.py exactly
+# ID_COLS = {'date', 'block', 'block_id', 'regime', 'next_regime', 'target',
+#            'block_open', 'block_high', 'block_low', 'block_close', 'block_volume'}
+
+
+# # ============================================================================
+# # DATA
+# # ============================================================================
+# def load_data(path):
+#     df = pd.read_csv(path)
+#     df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+#     df = df.sort_values(['date', 'block']).reset_index(drop=True)
+
+#     if 'next_regime' in df.columns:
+#         target_col = 'next_regime'
+#     elif 'target' in df.columns:
+#         target_col = 'target'
+#     else:
+#         raise ValueError("No target column found")
+#     return df, target_col
+
+
+# # ============================================================================
+# # TRANSITION ANALYSIS
+# # ============================================================================
+# def evaluate_transitions(y_true, y_pred, cur, classes):
+#     y_true = np.array(y_true); y_pred = np.array(y_pred); cur = np.array(cur)
+#     is_trans = (y_true != cur)
+#     n_trans = int(is_trans.sum())
+#     n_pers = int((~is_trans).sum())
+
+#     acc_trans = accuracy_score(y_true[is_trans], y_pred[is_trans]) if n_trans > 0 else 0
+#     acc_pers = accuracy_score(y_true[~is_trans], y_pred[~is_trans]) if n_pers > 0 else 0
+
+#     pred_trans = (y_pred != cur)
+#     detect_recall = pred_trans[is_trans].mean() if n_trans > 0 else 0
+#     detect_prec = is_trans[pred_trans].mean() if pred_trans.sum() > 0 else 0
+#     detect_f1 = (2 * detect_recall * detect_prec / (detect_recall + detect_prec)
+#                  if (detect_recall + detect_prec) > 0 else 0)
+
+#     correct_trans = is_trans & pred_trans
+#     target_acc = ((y_true[correct_trans] == y_pred[correct_trans]).mean()
+#                   if correct_trans.sum() > 0 else 0)
+
+#     print("\n  " + "=" * 60)
+#     print("  TRANSITION ANALYSIS")
+#     print("  " + "=" * 60)
+#     print(f"  Total blocks:      {len(y_true):,}")
+#     print(f"  Persistence:       {n_pers:,}  acc {acc_pers*100:.1f}%")
+#     print(f"  Transitions:       {n_trans:,}  acc {acc_trans*100:.1f}%")
+#     print(f"  " + "-" * 60)
+#     print(f"  Detection recall:    {detect_recall*100:.1f}%")
+#     print(f"  Detection precision: {detect_prec*100:.1f}%")
+#     print(f"  Detection F1:        {detect_f1:.3f}")
+#     print(f"  Target accuracy:     {target_acc*100:.1f}%")
+
+#     print(f"  " + "-" * 60)
+#     print(f"  Transitions OUT of each regime:")
+#     for cls in classes:
+#         mask = (cur == cls) & is_trans
+#         n = mask.sum()
+#         if n > 0:
+#             det = pred_trans[mask].mean()
+#             correct = (y_pred[mask] == y_true[mask]).mean()
+#             print(f"    {cls:15s}  n={n:4d}  detected={det*100:.0f}%  correct={correct*100:.0f}%")
+
+#     print(f"  Transitions INTO each regime:")
+#     for cls in classes:
+#         mask = (y_true == cls) & is_trans
+#         n = mask.sum()
+#         if n > 0:
+#             rec = (y_pred[mask] == cls).mean()
+#             print(f"    {cls:15s}  n={n:4d}  recall={rec*100:.0f}%")
+
+#     return {
+#         'n_transitions': n_trans, 'n_persistence': n_pers,
+#         'acc_transitions': round(acc_trans, 4),
+#         'acc_persistence': round(acc_pers, 4),
+#         'detect_recall': round(detect_recall, 4),
+#         'detect_precision': round(detect_prec, 4),
+#         'detect_f1': round(detect_f1, 4),
+#         'target_accuracy': round(target_acc, 4),
+#     }
+
+
+# # ============================================================================
+# # MAIN
+# # ============================================================================
+# def main():
+#     print("=" * 68)
+#     print("  TEST — Frozen model evaluation on unseen data")
+#     print("=" * 68)
+
+#     # ── Load model metadata ──
+#     cls_path = MODEL_DIR / "label_classes.json"
+#     if not cls_path.exists():
+#         raise FileNotFoundError(
+#             f"{cls_path} not found. Run main.py first to train the model.")
+
+#     cls_info = json.load(open(cls_path))
+#     le = LabelEncoder().fit(cls_info['classes'])
+#     train_feats = cls_info['feat_cols']
+#     target_col_saved = cls_info.get('target_col', None)
+
+#     # ── Load features ──
+#     df, target_col = load_data(FEATURES_CSV)
+#     if target_col_saved and target_col_saved in df.columns:
+#         target_col = target_col_saved
+#     df = df[df['date'] < TEST_END].reset_index(drop=True)
+#     print(f"  Features CSV: {FEATURES_CSV}")
+#     print(f"  Target:       '{target_col}'")
+
+#     # Ensure feature columns match training exactly
+#     for c in train_feats:
+#         if c not in df.columns:
+#             df[c] = 0
+#     feat_cols = train_feats
+
+#     # ── Load frozen model ──
+#     model = xgb.XGBClassifier()
+#     model.load_model(str(MODEL_DIR / "xgb_next_block.json"))
+
+#     X = df[feat_cols].fillna(0).values
+#     y = le.transform(df[target_col].values)
+#     cur = df['regime'].values
+
+#     tr = df['date'].values < SPLIT_DATE
+#     te = df['date'].values >= SPLIT_DATE
+
+#     print(f"  In-sample:   {tr.sum():,} blocks")
+#     print(f"  Out-sample:  {te.sum():,} blocks  ({df[te].date.min()} → {df[te].date.max()})")
+
+#     # ── In-sample (for overfit gap) ──
+#     proba_in = model.predict_proba(X[tr])
+#     acc_in = accuracy_score(y[tr], proba_in.argmax(1))
+#     ll_in = log_loss(y[tr], proba_in, labels=list(range(len(le.classes_))))
+
+#     # ── Out-of-sample ──
+#     proba = model.predict_proba(X[te])
+#     pred = proba.argmax(1)
+#     y_te = y[te]; cur_te = cur[te]
+#     y_te_labels = le.inverse_transform(y_te)
+#     pred_labels = le.classes_[pred]
+
+#     acc = accuracy_score(y_te, pred)
+#     ll = log_loss(y_te, proba, labels=list(range(len(le.classes_))))
+#     f1 = f1_score(y_te, pred, average='macro')
+#     persist = accuracy_score(y_te_labels, cur_te)
+#     majority = pd.Series(y_te).value_counts(normalize=True).max()
+#     lift = acc - persist
+
+#     # ── Results ──
+#     print("\n" + "=" * 68)
+#     print("  RESULTS")
+#     print("=" * 68)
+#     print(f"  Persistence baseline:  {persist*100:.1f}%")
+#     print(f"  Majority class:        {majority*100:.1f}%")
+#     print(f"  " + "-" * 60)
+#     print(f"  OUT-OF-SAMPLE acc:     {acc*100:.1f}%  (F1 {f1:.3f}, log-loss {ll:.3f})")
+#     print(f"  IN-SAMPLE acc:         {acc_in*100:.1f}%  (log-loss {ll_in:.3f})")
+#     print(f"  OVERFIT GAP:           {(acc_in-acc)*100:.1f} pts")
+#     print(f"  LIFT over persistence: +{lift*100:.1f} pts")
+
+#     # ── Per-class report ──
+#     print("\n  Per-class report:")
+#     print(classification_report(y_te_labels, pred_labels, labels=REGIMES, zero_division=0))
+
+#     # ── Confusion matrix ──
+#     cm = confusion_matrix(y_te_labels, pred_labels, labels=REGIMES)
+#     cm_df = pd.DataFrame(cm, index=REGIMES, columns=REGIMES)
+#     print("  Confusion matrix:")
+#     print(cm_df)
+
+#     # ── Prediction distribution check ──
+#     print("\n  " + "=" * 60)
+#     print("  PREDICTION vs ACTUAL DISTRIBUTION")
+#     print("  " + "=" * 60)
+#     for cls in REGIMES:
+#         p = (pred_labels == cls).mean() * 100
+#         a = (y_te_labels == cls).mean() * 100
+#         print(f"    {cls:15s}  predicted {p:5.1f}%   actual {a:5.1f}%   diff {p-a:+.1f}")
+
+#     # ── Transition analysis ──
+#     trans_metrics = evaluate_transitions(y_te_labels, pred_labels, cur_te, REGIMES)
+
+#     # ── Confidence calibration ──
+#     print("\n  " + "=" * 60)
+#     print("  CONFIDENCE CALIBRATION")
+#     print("  " + "=" * 60)
+#     conf = proba.max(1)
+#     is_trans = (y_te_labels != cur_te)
+#     rows = []
+#     for t in [0.30, 0.35, 0.40, 0.50, 0.60, 0.70]:
+#         mask = conf >= t
+#         if mask.sum() == 0: continue
+#         a = accuracy_score(y_te[mask], pred[mask])
+#         tm = mask & is_trans
+#         ta = accuracy_score(y_te[tm], pred[tm]) if tm.sum() > 0 else 0
+#         rows.append({'min_conf': t, 'n_blocks': int(mask.sum()),
+#                      'pct': round(mask.mean()*100, 1),
+#                      'acc': round(a*100, 1),
+#                      'trans_acc': round(ta*100, 1)})
+#     conf_df = pd.DataFrame(rows)
+#     print(conf_df.to_string(index=False))
+
+#     # ── Monthly accuracy ──
+#     print("\n  " + "=" * 60)
+#     print("  MONTHLY ACCURACY")
+#     print("  " + "=" * 60)
+#     res = df[te][['date', 'block', 'regime']].copy()
+#     res['actual_next'] = y_te_labels
+#     res['pred_next'] = pred_labels
+#     res['confidence'] = conf.round(3)
+#     res['correct'] = (pred_labels == y_te_labels)
+#     res['is_transition'] = (res['regime'] != res['actual_next'])
+#     monthly = res.assign(month=res['date'].str[:7]).groupby('month').correct.agg(['mean', 'count'])
+#     monthly.columns = ['accuracy', 'n']
+#     monthly['accuracy'] = (monthly['accuracy'] * 100).round(1)
+#     for m, row in monthly.iterrows():
+#         bar = '█' * int(row.accuracy / 2)
+#         print(f"    {m}  {row.accuracy:5.1f}%  n={int(row.n):3d}  {bar}")
+
+#     # ── Save ──
+#     res.to_csv(OUT / "predictions.csv", index=False)
+#     cm_df.to_csv(OUT / "confusion_matrix.csv")
+#     conf_df.to_csv(OUT / "confidence_calibration.csv", index=False)
+#     monthly.to_csv(OUT / "monthly_accuracy.csv")
+
+#     json.dump({
+#         'split_date': SPLIT_DATE, 'test_end': TEST_END,
+#         'n_in': int(tr.sum()), 'n_out': int(te.sum()),
+#         'n_features': len(feat_cols),
+#         'insample_acc': round(float(acc_in), 4),
+#         'outsample_acc': round(float(acc), 4),
+#         'outsample_f1': round(float(f1), 4),
+#         'outsample_logloss': round(float(ll), 4),
+#         'overfit_gap': round(float(acc_in - acc), 4),
+#         'persistence_baseline': round(float(persist), 4),
+#         'majority_baseline': round(float(majority), 4),
+#         'lift': round(float(lift), 4),
+#         'transition_metrics': trans_metrics,
+#         'per_class': classification_report(y_te_labels, pred_labels, labels=REGIMES,
+#                                             zero_division=0, output_dict=True),
+#     }, open(OUT / "metrics.json", "w"), indent=2)
+
+#     # ── Plots ──
+#     fig, ax = plt.subplots(figsize=(7, 6))
+#     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+#                 xticklabels=REGIMES, yticklabels=REGIMES, ax=ax)
+#     ax.set_xlabel("Predicted next"); ax.set_ylabel("Actual next")
+#     ax.set_title(f"Out-of-Sample — {acc*100:.1f}%", fontweight="bold")
+#     plt.tight_layout(); plt.savefig(OUT / "confusion_matrix.png", dpi=150); plt.close()
+
+#     if is_trans.sum() > 0:
+#         cm_t = confusion_matrix(y_te_labels[is_trans], pred_labels[is_trans], labels=REGIMES)
+#         acc_t = accuracy_score(y_te_labels[is_trans], pred_labels[is_trans])
+#         fig, ax = plt.subplots(figsize=(7, 6))
+#         sns.heatmap(cm_t, annot=True, fmt="d", cmap="Oranges",
+#                     xticklabels=REGIMES, yticklabels=REGIMES, ax=ax)
+#         ax.set_xlabel("Predicted next"); ax.set_ylabel("Actual next")
+#         ax.set_title(f"Transitions only — {acc_t*100:.1f}%", fontweight="bold")
+#         plt.tight_layout(); plt.savefig(OUT / "confusion_matrix_transitions.png", dpi=150); plt.close()
+
+#     fig, ax = plt.subplots(figsize=(12, 5))
+#     ax.bar(monthly.index, monthly['accuracy'], color='#3B82F6', alpha=0.8)
+#     ax.axhline(acc*100, ls='--', color='#EF4444', label=f'overall {acc*100:.1f}%')
+#     ax.axhline(persist*100, ls=':', color='#64748B', label=f'persistence {persist*100:.1f}%')
+#     ax.set_ylabel("Accuracy %"); ax.set_ylim(0, 60)
+#     ax.set_title("Monthly Out-of-Sample Accuracy", fontweight="bold")
+#     plt.xticks(rotation=45); ax.legend(); ax.grid(alpha=0.3, axis='y')
+#     plt.tight_layout(); plt.savefig(OUT / "monthly_accuracy.png", dpi=150); plt.close()
+
+#     print(f"\n  Saved → {OUT}/")
+#     print("=" * 68)
+
+
+# if __name__ == "__main__":
+#     main()
+# """
+# test.py — Evaluate frozen model on out-of-sample data
+
+# Loads model from main.py, predicts 2025-01-01 -> 2026-07-01.
+# Just load -> predict -> measure. No retraining.
+
+# Usage:
+#     python test.py
+#     FEATURES_CSV=features.csv MODEL_DIR=results_main python test.py
+# """
+# import os, json
+# from pathlib import Path
+
+# import numpy as np
+# import pandas as pd
+# import xgboost as xgb
+# from sklearn.preprocessing import LabelEncoder
+# from sklearn.metrics import (accuracy_score, log_loss, f1_score,
+#                              classification_report, confusion_matrix)
+# import matplotlib; matplotlib.use("Agg")
+# import matplotlib.pyplot as plt
+# import seaborn as sns
+
+# FEATURES_CSV = os.environ.get("FEATURES_CSV", "latest_features.csv")
+# MODEL_DIR    = Path(os.environ.get("MODEL_DIR", "latest_results_main"))
+# SPLIT_DATE   = os.environ.get("SPLIT_DATE", "2025-01-01")
+# TEST_END     = os.environ.get("TEST_END", "2026-07-01")
+# OUT          = Path(os.environ.get("OUT", "aa_results_test"))
+# OUT.mkdir(parents=True, exist_ok=True)
+
+# REGIMES = ['bearish', 'bullish', 'chop_calm', 'chop_volatile']
+
+# # Must match main.py
+# ID_COLS = {'date', 'block', 'block_id', 'regime', 'next_regime', 'target'}
+
+
+# def load_data(path):
+#     df = pd.read_csv(path)
+#     df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+#     df = df.sort_values(['date', 'block']).reset_index(drop=True)
+#     target_col = 'next_regime' if 'next_regime' in df.columns else 'target'
+#     return df, target_col
+
+
+# def evaluate_transitions(y_true, y_pred, cur, classes):
+#     y_true = np.array(y_true); y_pred = np.array(y_pred); cur = np.array(cur)
+#     is_trans = (y_true != cur)
+#     n_trans = int(is_trans.sum()); n_pers = int((~is_trans).sum())
+
+#     acc_trans = accuracy_score(y_true[is_trans], y_pred[is_trans]) if n_trans > 0 else 0
+#     acc_pers = accuracy_score(y_true[~is_trans], y_pred[~is_trans]) if n_pers > 0 else 0
+
+#     pred_trans = (y_pred != cur)
+#     det_recall = pred_trans[is_trans].mean() if n_trans > 0 else 0
+#     det_prec = is_trans[pred_trans].mean() if pred_trans.sum() > 0 else 0
+#     det_f1 = (2*det_recall*det_prec/(det_recall+det_prec) if det_recall+det_prec > 0 else 0)
+
+#     correct_det = is_trans & pred_trans
+#     tgt_acc = (y_true[correct_det] == y_pred[correct_det]).mean() if correct_det.sum() > 0 else 0
+
+#     print("\n  " + "=" * 60)
+#     print("  TRANSITION ANALYSIS")
+#     print("  " + "=" * 60)
+#     print(f"  Total blocks:      {len(y_true):,}")
+#     print(f"  Persistence:       {n_pers:,}  acc {acc_pers*100:.1f}%")
+#     print(f"  Transitions:       {n_trans:,}  acc {acc_trans*100:.1f}%")
+#     print(f"  " + "-" * 60)
+#     print(f"  Detection recall:    {det_recall*100:.1f}%")
+#     print(f"  Detection precision: {det_prec*100:.1f}%")
+#     print(f"  Detection F1:        {det_f1:.3f}")
+#     print(f"  Target accuracy:     {tgt_acc*100:.1f}%")
+
+#     print(f"  " + "-" * 60)
+#     print(f"  Transitions OUT of each regime:")
+#     for cls in classes:
+#         mask = (cur == cls) & is_trans
+#         n = mask.sum()
+#         if n > 0:
+#             det = pred_trans[mask].mean()
+#             correct = (y_pred[mask] == y_true[mask]).mean()
+#             print(f"    {cls:15s}  n={n:4d}  detected={det*100:.0f}%  correct={correct*100:.0f}%")
+
+#     print(f"  Transitions INTO each regime:")
+#     for cls in classes:
+#         mask = (y_true == cls) & is_trans
+#         n = mask.sum()
+#         if n > 0:
+#             rec = (y_pred[mask] == cls).mean()
+#             print(f"    {cls:15s}  n={n:4d}  recall={rec*100:.0f}%")
+
+#     return {
+#         'n_transitions': n_trans, 'n_persistence': n_pers,
+#         'acc_transitions': round(acc_trans, 4),
+#         'acc_persistence': round(acc_pers, 4),
+#         'detect_recall': round(det_recall, 4),
+#         'detect_precision': round(det_prec, 4),
+#         'detect_f1': round(det_f1, 4),
+#         'target_accuracy': round(tgt_acc, 4),
+#     }
+
+
+# def main():
+#     print("=" * 68)
+#     print("  TEST — Frozen model evaluation")
+#     print("=" * 68)
+
+#     # Load model metadata
+#     cls_path = MODEL_DIR / "label_classes.json"
+#     if not cls_path.exists():
+#         raise FileNotFoundError(f"{cls_path} not found. Run main.py first.")
+
+#     cls_info = json.load(open(cls_path))
+#     le = LabelEncoder().fit(cls_info['classes'])
+#     train_feats = cls_info['feat_cols']
+#     target_col_saved = cls_info.get('target_col', None)
+
+#     # Load features
+#     df, target_col = load_data(FEATURES_CSV)
+#     if target_col_saved and target_col_saved in df.columns:
+#         target_col = target_col_saved
+#     df = df[df['date'] < TEST_END].reset_index(drop=True)
+#     print(f"  Features:  {FEATURES_CSV}")
+#     print(f"  Target:    '{target_col}'")
+
+#     # Match feature columns to training
+#     for c in train_feats:
+#         if c not in df.columns:
+#             df[c] = 0
+#     feat_cols = train_feats
+
+#     # Load model
+#     model = xgb.XGBClassifier()
+#     model.load_model(str(MODEL_DIR / "xgb_next_block.json"))
+
+#     X = df[feat_cols].fillna(0).values
+#     y = le.transform(df[target_col].values)
+#     cur = df['regime'].values
+
+#     tr = df['date'].values < SPLIT_DATE
+#     te = df['date'].values >= SPLIT_DATE
+#     print(f"  In-sample:   {tr.sum():,} blocks")
+#     print(f"  Out-sample:  {te.sum():,} blocks ({df[te].date.min()} -> {df[te].date.max()})")
+
+#     # In-sample (overfit gap)
+#     proba_in = model.predict_proba(X[tr])
+#     acc_in = accuracy_score(y[tr], proba_in.argmax(1))
+#     ll_in = log_loss(y[tr], proba_in, labels=list(range(len(le.classes_))))
+
+#     # Out-of-sample
+#     proba = model.predict_proba(X[te])
+#     pred = proba.argmax(1)
+#     y_te = y[te]; cur_te = cur[te]
+#     y_te_labels = le.inverse_transform(y_te)
+#     pred_labels = le.classes_[pred]
+
+#     acc = accuracy_score(y_te, pred)
+#     ll = log_loss(y_te, proba, labels=list(range(len(le.classes_))))
+#     f1 = f1_score(y_te, pred, average='macro')
+#     persist = accuracy_score(y_te_labels, cur_te)
+#     majority = pd.Series(y_te).value_counts(normalize=True).max()
+#     lift = acc - persist
+
+#     # Results
+#     print("\n" + "=" * 68)
+#     print("  RESULTS")
+#     print("=" * 68)
+#     print(f"  Persistence baseline:  {persist*100:.1f}%")
+#     print(f"  Majority class:        {majority*100:.1f}%")
+#     print(f"  " + "-" * 60)
+#     print(f"  OUT-OF-SAMPLE acc:     {acc*100:.1f}%  (F1 {f1:.3f}, log-loss {ll:.3f})")
+#     print(f"  IN-SAMPLE acc:         {acc_in*100:.1f}%  (log-loss {ll_in:.3f})")
+#     print(f"  OVERFIT GAP:           {(acc_in-acc)*100:.1f} pts")
+#     print(f"  LIFT over persistence: +{lift*100:.1f} pts")
+
+#     # Per-class
+#     print("\n  Per-class report:")
+#     print(classification_report(y_te_labels, pred_labels, labels=REGIMES, zero_division=0))
+
+#     # Confusion matrix
+#     cm = confusion_matrix(y_te_labels, pred_labels, labels=REGIMES)
+#     cm_df = pd.DataFrame(cm, index=REGIMES, columns=REGIMES)
+#     print("  Confusion matrix:")
+#     print(cm_df)
+
+#     # Prediction distribution
+#     print("\n  " + "=" * 60)
+#     print("  PREDICTION vs ACTUAL DISTRIBUTION")
+#     print("  " + "=" * 60)
+#     for cls in REGIMES:
+#         p = (pred_labels == cls).mean() * 100
+#         a = (y_te_labels == cls).mean() * 100
+#         print(f"    {cls:15s}  predicted {p:5.1f}%   actual {a:5.1f}%   diff {p-a:+.1f}")
+
+#     # Transition analysis
+#     trans_metrics = evaluate_transitions(y_te_labels, pred_labels, cur_te, REGIMES)
+
+#     # Confidence calibration
+#     print("\n  " + "=" * 60)
+#     print("  CONFIDENCE CALIBRATION")
+#     print("  " + "=" * 60)
+#     conf = proba.max(1)
+#     is_trans = (y_te_labels != cur_te)
+#     rows = []
+#     for t in [0.30, 0.35, 0.40, 0.50, 0.60, 0.70]:
+#         mask = conf >= t
+#         if mask.sum() == 0: continue
+#         a = accuracy_score(y_te[mask], pred[mask])
+#         tm = mask & is_trans
+#         ta = accuracy_score(y_te[tm], pred[tm]) if tm.sum() > 0 else 0
+#         rows.append({'min_conf': t, 'n_blocks': int(mask.sum()),
+#                      'pct': round(mask.mean()*100, 1),
+#                      'acc': round(a*100, 1),
+#                      'trans_acc': round(ta*100, 1)})
+#     conf_df = pd.DataFrame(rows)
+#     print(conf_df.to_string(index=False))
+
+#     # Monthly accuracy
+#     print("\n  " + "=" * 60)
+#     print("  MONTHLY ACCURACY")
+#     print("  " + "=" * 60)
+#     res = df[te][['date', 'block', 'regime']].copy()
+#     res['actual_next'] = y_te_labels
+#     res['pred_next'] = pred_labels
+#     res['confidence'] = conf.round(3)
+#     res['correct'] = (pred_labels == y_te_labels)
+#     res['is_transition'] = (res['regime'] != res['actual_next'])
+#     monthly = res.assign(month=res['date'].str[:7]).groupby('month').correct.agg(['mean', 'count'])
+#     monthly.columns = ['accuracy', 'n']
+#     monthly['accuracy'] = (monthly['accuracy'] * 100).round(1)
+#     for m, row in monthly.iterrows():
+#         bar = '#' * int(row.accuracy / 2)
+#         print(f"    {m}  {row.accuracy:5.1f}%  n={int(row.n):3d}  {bar}")
+
+#     # Save
+#     res.to_csv(OUT / "predictions.csv", index=False)
+#     cm_df.to_csv(OUT / "confusion_matrix.csv")
+#     conf_df.to_csv(OUT / "confidence_calibration.csv", index=False)
+#     monthly.to_csv(OUT / "monthly_accuracy.csv")
+
+#     json.dump({
+#         'split_date': SPLIT_DATE, 'test_end': TEST_END,
+#         'n_in': int(tr.sum()), 'n_out': int(te.sum()),
+#         'n_features': len(feat_cols),
+#         'insample_acc': round(float(acc_in), 4),
+#         'outsample_acc': round(float(acc), 4),
+#         'outsample_f1': round(float(f1), 4),
+#         'outsample_logloss': round(float(ll), 4),
+#         'overfit_gap': round(float(acc_in - acc), 4),
+#         'persistence_baseline': round(float(persist), 4),
+#         'majority_baseline': round(float(majority), 4),
+#         'lift': round(float(lift), 4),
+#         'transition_metrics': trans_metrics,
+#         'per_class': classification_report(y_te_labels, pred_labels, labels=REGIMES,
+#                                             zero_division=0, output_dict=True),
+#     }, open(OUT / "metrics.json", "w"), indent=2)
+
+#     # Plots
+#     fig, ax = plt.subplots(figsize=(7, 6))
+#     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+#                 xticklabels=REGIMES, yticklabels=REGIMES, ax=ax)
+#     ax.set_xlabel("Predicted next"); ax.set_ylabel("Actual next")
+#     ax.set_title(f"Out-of-Sample -- {acc*100:.1f}%", fontweight="bold")
+#     plt.tight_layout(); plt.savefig(OUT / "confusion_matrix.png", dpi=150); plt.close()
+
+#     if is_trans.sum() > 0:
+#         cm_t = confusion_matrix(y_te_labels[is_trans], pred_labels[is_trans], labels=REGIMES)
+#         acc_t = accuracy_score(y_te_labels[is_trans], pred_labels[is_trans])
+#         fig, ax = plt.subplots(figsize=(7, 6))
+#         sns.heatmap(cm_t, annot=True, fmt="d", cmap="Oranges",
+#                     xticklabels=REGIMES, yticklabels=REGIMES, ax=ax)
+#         ax.set_xlabel("Predicted next"); ax.set_ylabel("Actual next")
+#         ax.set_title(f"Transitions only -- {acc_t*100:.1f}%", fontweight="bold")
+#         plt.tight_layout(); plt.savefig(OUT / "confusion_matrix_transitions.png", dpi=150); plt.close()
+
+#     fig, ax = plt.subplots(figsize=(12, 5))
+#     ax.bar(monthly.index, monthly['accuracy'], color='#3B82F6', alpha=0.8)
+#     ax.axhline(acc*100, ls='--', color='#EF4444', label=f'overall {acc*100:.1f}%')
+#     ax.axhline(persist*100, ls=':', color='#64748B', label=f'persistence {persist*100:.1f}%')
+#     ax.set_ylabel("Accuracy %"); ax.set_ylim(0, 60)
+#     ax.set_title("Monthly Out-of-Sample Accuracy", fontweight="bold")
+#     plt.xticks(rotation=45); ax.legend(); ax.grid(alpha=0.3, axis='y')
+#     plt.tight_layout(); plt.savefig(OUT / "monthly_accuracy.png", dpi=150); plt.close()
+
+#     print(f"\n  Saved -> {OUT}/")
+#     print("=" * 68)
+
+
+# if __name__ == "__main__":
+#     main() 
+"""
+test.py — Evaluate frozen model on out-of-sample data
+
+Loads model from main.py, predicts 2025-01-01 -> 2026-07-01.
+Just load -> predict -> measure. No retraining.
+
+Usage:
+    python test.py
+    FEATURES_CSV=features.csv MODEL_DIR=results_main python test.py
+"""
+import os, json
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (accuracy_score, log_loss, f1_score,
+                             classification_report, confusion_matrix,
+                             balanced_accuracy_score, roc_auc_score)
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from config import eval_config, describe
+
+# All tunables live in config.py. Override with EV_<KEY>=value, e.g.
+#   EV_USE_FILTER=1 EV_CONF_THRESHOLD=0.5 python test.py
+CFG = eval_config()
+
+FEATURES_CSV = os.environ.get("FEATURES_CSV", "latest_features.csv")
+# Defaults match the artifact directories actually present in this repo.
+MODEL_DIR    = Path(os.environ.get("MODEL_DIR", "latest_results_main"))
+SPLIT_DATE   = os.environ.get("SPLIT_DATE", "2025-01-01")
+TEST_END     = os.environ.get("TEST_END", "2026-07-01")
+OUT          = Path(os.environ.get("OUT", "aa_results_test"))
+OUT.mkdir(parents=True, exist_ok=True)
+
+REGIMES = ['bearish', 'bullish', 'chop_calm', 'chop_volatile']
+
+# Must match main.py
+ID_COLS = {'date', 'block', 'block_id', 'regime', 'next_regime', 'target'}
+
+
+def load_data(path):
+    df = pd.read_csv(path)
+    df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
+    df = df.sort_values(['date', 'block']).reset_index(drop=True)
+    target_col = 'next_regime' if 'next_regime' in df.columns else 'target'
+    return df, target_col
+
+
+def evaluate_transitions(y_true, y_pred, cur, classes):
+    y_true = np.array(y_true); y_pred = np.array(y_pred); cur = np.array(cur)
+    is_trans = (y_true != cur)
+    n_trans = int(is_trans.sum()); n_pers = int((~is_trans).sum())
+
+    acc_trans = accuracy_score(y_true[is_trans], y_pred[is_trans]) if n_trans > 0 else 0
+    acc_pers = accuracy_score(y_true[~is_trans], y_pred[~is_trans]) if n_pers > 0 else 0
+
+    pred_trans = (y_pred != cur)
+    det_recall = pred_trans[is_trans].mean() if n_trans > 0 else 0
+    det_prec = is_trans[pred_trans].mean() if pred_trans.sum() > 0 else 0
+    det_f1 = (2*det_recall*det_prec/(det_recall+det_prec) if det_recall+det_prec > 0 else 0)
+
+    correct_det = is_trans & pred_trans
+    tgt_acc = (y_true[correct_det] == y_pred[correct_det]).mean() if correct_det.sum() > 0 else 0
+
+    print("\n  " + "=" * 60)
+    print("  TRANSITION ANALYSIS")
+    print("  " + "=" * 60)
+    print(f"  Total blocks:      {len(y_true):,}")
+    print(f"  Persistence:       {n_pers:,}  acc {acc_pers*100:.1f}%")
+    print(f"  Transitions:       {n_trans:,}  acc {acc_trans*100:.1f}%")
+    print(f"  " + "-" * 60)
+    print(f"  Detection recall:    {det_recall*100:.1f}%")
+    print(f"  Detection precision: {det_prec*100:.1f}%")
+    print(f"  Detection F1:        {det_f1:.3f}")
+    print(f"  Target accuracy:     {tgt_acc*100:.1f}%")
+
+    print(f"  " + "-" * 60)
+    print(f"  Transitions OUT of each regime:")
+    for cls in classes:
+        mask = (cur == cls) & is_trans
+        n = mask.sum()
+        if n > 0:
+            det = pred_trans[mask].mean()
+            correct = (y_pred[mask] == y_true[mask]).mean()
+            print(f"    {cls:15s}  n={n:4d}  detected={det*100:.0f}%  correct={correct*100:.0f}%")
+
+    print(f"  Transitions INTO each regime:")
+    for cls in classes:
+        mask = (y_true == cls) & is_trans
+        n = mask.sum()
+        if n > 0:
+            rec = (y_pred[mask] == cls).mean()
+            print(f"    {cls:15s}  n={n:4d}  recall={rec*100:.0f}%")
+
+    return {
+        'n_transitions': n_trans, 'n_persistence': n_pers,
+        'acc_transitions': round(acc_trans, 4),
+        'acc_persistence': round(acc_pers, 4),
+        'detect_recall': round(det_recall, 4),
+        'detect_precision': round(det_prec, 4),
+        'detect_f1': round(det_f1, 4),
+        'target_accuracy': round(tgt_acc, 4),
+    }
+
+
+def main():
+    print("=" * 68)
+    print("  TEST — Frozen model evaluation")
+    print("=" * 68)
+    print(describe(CFG, "config (override with EV_<KEY>=value):"))
+
+    # Load model metadata
+    cls_path = MODEL_DIR / "label_classes.json"
+    if not cls_path.exists():
+        raise FileNotFoundError(f"{cls_path} not found. Run main.py first.")
+
+    cls_info = json.load(open(cls_path))
+    le = LabelEncoder().fit(cls_info['classes'])
+    train_feats = cls_info['feat_cols']
+    target_col_saved = cls_info.get('target_col', None)
+
+    # Load features
+    df, target_col = load_data(FEATURES_CSV)
+    if target_col_saved and target_col_saved in df.columns:
+        target_col = target_col_saved
+    df = df[df['date'] < TEST_END].reset_index(drop=True)
+    print(f"  Features:  {FEATURES_CSV}")
+    print(f"  Target:    '{target_col}'")
+
+    # Match feature columns to training
+    for c in train_feats:
+        if c not in df.columns:
+            df[c] = 0
+    feat_cols = train_feats
+
+    # Load model
+    model = xgb.XGBClassifier()
+    model.load_model(str(MODEL_DIR / "xgb_next_block.json"))
+
+    X = df[feat_cols].fillna(0).values
+    y = le.transform(df[target_col].values)
+    cur = df['regime'].values
+
+    tr = df['date'].values < SPLIT_DATE
+    te = df['date'].values >= SPLIT_DATE
+    print(f"  In-sample:   {tr.sum():,} blocks")
+    print(f"  Out-sample:  {te.sum():,} blocks ({df[te].date.min()} -> {df[te].date.max()})")
+
+    # In-sample (overfit gap)
+    proba_in = model.predict_proba(X[tr])
+    acc_in = accuracy_score(y[tr], proba_in.argmax(1))
+    ll_in = log_loss(y[tr], proba_in, labels=list(range(len(le.classes_))))
+
+    # Out-of-sample — RAW predictions
+    proba = model.predict_proba(X[te])
+    raw_pred = proba.argmax(1)
+    y_te = y[te]; cur_te = cur[te]
+    y_te_labels = le.inverse_transform(y_te)
+    raw_pred_labels = le.classes_[raw_pred]
+
+    # ── HYSTERESIS FILTER (applied to predictions, not labels) ──
+    # The model's raw predictions flip every block (68% of transitions
+    # are single-block noise). This filter:
+    #   1. Confidence gate: only predict a transition if confidence > threshold
+    #   2. Online smoothing: a predicted transition must persist for 2+ blocks
+    # This doesn't change the labels — it filters the model's output.
+
+    CONF_THRESHOLD = CFG['conf_threshold']
+    MIN_PERSIST = CFG['min_persist']
+
+    # Step 1: Confidence gating
+    gated = np.empty(len(raw_pred), dtype=object)
+    for i in range(len(raw_pred)):
+        raw_class = le.classes_[raw_pred[i]]
+        cur_class = cur_te[i]
+        conf = proba[i].max()
+        if raw_class != cur_class and conf < CONF_THRESHOLD:
+            gated[i] = cur_class  # not confident enough → persist
+        else:
+            gated[i] = raw_class
+
+    # Step 2: Online hysteresis — STRICTLY CAUSAL.
+    #
+    # BUGFIX (look-ahead): this loop used to retroactively rewrite already-
+    # emitted predictions when a transition confirmed:
+    #     for j in range(i - pending_count + 1, i + 1):
+    #         filtered[j] = confirmed
+    # At block j that information did not exist yet — it only arrives at block
+    # i > j. Measured effect on the real model output:
+    #     raw, no filter ........ 36.85%
+    #     with retroactive rewrite 48.12%   <- fake
+    #     causal (this version) .. 31.57%   <- honest
+    # Anyone running the old code saw ~48% and a large apparent edge that was
+    # entirely look-ahead.
+    #
+    # NOTE: honestly evaluated the filter now scores BELOW the raw model and
+    # below the 32.95% persistence baseline. That is expected — hysteresis
+    # assumes sticky regimes, and 67% of blocks change regime. Both numbers are
+    # printed below; prefer RAW unless the filtered number is actually higher.
+    filtered = np.empty(len(gated), dtype=object)
+    confirmed = gated[0]    # current confirmed regime
+    pending = None           # potential new regime
+    pending_count = 0
+
+    for i in range(len(gated)):
+        if gated[i] == confirmed:
+            # agrees with confirmed → reset pending
+            filtered[i] = confirmed
+            pending = None; pending_count = 0
+        elif gated[i] == pending:
+            # continues the pending transition
+            pending_count += 1
+            if pending_count >= MIN_PERSIST:
+                # confirmed — switch from THIS block forward only.
+                # Earlier pending blocks keep what was emitted at the time.
+                confirmed = pending
+                filtered[i] = confirmed
+                pending = None; pending_count = 0
+            else:
+                filtered[i] = confirmed  # not yet confirmed → keep old
+        else:
+            # new potential transition
+            pending = gated[i]; pending_count = 1
+            filtered[i] = confirmed  # not yet confirmed
+
+    # The filter is OFF by default (config: use_filter). Honestly evaluated it
+    # scores below the raw model and below the persistence baseline — it assumes
+    # sticky regimes, but most blocks change. Enable with EV_USE_FILTER=1.
+    pred_labels = filtered if CFG['use_filter'] else raw_pred_labels
+    pred = le.transform(pred_labels)
+
+    raw_acc = accuracy_score(y_te_labels, raw_pred_labels)
+    filt_acc = accuracy_score(y_te_labels, filtered)
+    acc = accuracy_score(y_te, pred)
+    ll = log_loss(y_te, proba, labels=list(range(len(le.classes_))))
+    f1 = f1_score(y_te, pred, average='macro')
+    bal = balanced_accuracy_score(y_te, pred)
+    persist = accuracy_score(y_te_labels, cur_te)
+    majority = pd.Series(y_te).value_counts(normalize=True).max()
+
+    # Markov baseline: predict argmax P(next | current) from the TRAINING
+    # transition matrix, using zero features. On v1 labels this BEAT the
+    # 74-feature model (37.28% vs 36.85%), which is why it is reported here —
+    # persistence and majority are too weak to be informative on their own.
+    trans_map = pd.crosstab(df[tr]['regime'], df[tr][target_col],
+                            normalize='index').idxmax(1).to_dict()
+    markov = (pd.Series(cur_te).map(trans_map).fillna(
+        pd.Series(y_te_labels).mode()[0]).values == y_te_labels).mean()
+
+    # Per-class one-vs-rest AUC. Unlike accuracy this is unaffected by class
+    # imbalance and shows what the model knows even when argmax collapses.
+    aucs = {}
+    for i, cls in enumerate(le.classes_):
+        yb = (y_te == i).astype(int)
+        if 0 < yb.sum() < len(yb):
+            aucs[cls] = roc_auc_score(yb, proba[:, i])
+
+    print("\n" + "=" * 68)
+    print("  RESULTS")
+    print("=" * 68)
+    print("  BASELINES (a model must beat the strongest, not the weakest)")
+    print(f"    persistence  (next = current)   {persist*100:5.2f}%")
+    print(f"    majority class                  {majority*100:5.2f}%")
+    print(f"    Markov       (zero features)    {markov*100:5.2f}%   <- the real bar")
+    print("  " + "-" * 60)
+    print(f"  ACCURACY                          {acc*100:5.2f}%")
+    print(f"    lift over majority              {(acc-majority)*100:+5.2f} pp")
+    print(f"    lift over Markov                {(acc-markov)*100:+5.2f} pp")
+    print(f"    lift over persistence           {(acc-persist)*100:+5.2f} pp")
+    print(f"  BALANCED ACCURACY                 {bal*100:5.2f}%   "
+          f"(random = {100/len(REGIMES):.1f}%)")
+    print(f"  macro F1                          {f1:.3f}")
+    print(f"  log-loss                          {ll:.3f}")
+    if aucs:
+        print("  per-class AUC (imbalance-proof):")
+        for cls, a in aucs.items():
+            print(f"    {cls:15s} {a:.4f}")
+    print("  " + "-" * 60)
+    print(f"  raw (unfiltered)                  {raw_acc*100:5.2f}%")
+    print(f"  filtered (conf>{CONF_THRESHOLD}, persist>={MIN_PERSIST})"
+          f"       {filt_acc*100:5.2f}%")
+    print(f"  filter ACTIVE                     {CFG['use_filter']}"
+          "   (EV_USE_FILTER=1 to enable)")
+    print(f"  IN-SAMPLE acc                     {acc_in*100:5.2f}%  "
+          f"(log-loss {ll_in:.3f})")
+    print(f"  OVERFIT GAP                       {(acc_in-acc)*100:5.2f} pp")
+    print("\n  With one class near 67% of the data, raw accuracy is close to")
+    print("  meaningless. Read lift over Markov and balanced accuracy.")
+
+    # Per-class
+    print("\n  Per-class report:")
+    print(classification_report(y_te_labels, pred_labels, labels=REGIMES, zero_division=0))
+
+    # Confusion matrix
+    cm = confusion_matrix(y_te_labels, pred_labels, labels=REGIMES)
+    cm_df = pd.DataFrame(cm, index=REGIMES, columns=REGIMES)
+    print("  Confusion matrix:")
+    print(cm_df)
+
+    # Prediction distribution
+    print("\n  " + "=" * 60)
+    print("  PREDICTION vs ACTUAL DISTRIBUTION")
+    print("  " + "=" * 60)
+    for cls in REGIMES:
+        p = (pred_labels == cls).mean() * 100
+        a = (y_te_labels == cls).mean() * 100
+        print(f"    {cls:15s}  predicted {p:5.1f}%   actual {a:5.1f}%   diff {p-a:+.1f}")
+
+    # Transition analysis
+    trans_metrics = evaluate_transitions(y_te_labels, pred_labels, cur_te, REGIMES)
+
+    # Confidence calibration
+    print("\n  " + "=" * 60)
+    print("  CONFIDENCE CALIBRATION")
+    print("  " + "=" * 60)
+    conf = proba.max(1)
+    is_trans = (y_te_labels != cur_te)
+    rows = []
+    for t in [float(x) for x in str(CFG['conf_grid']).split(',')]:
+        mask = conf >= t
+        if mask.sum() == 0: continue
+        a = accuracy_score(y_te[mask], pred[mask])
+        tm = mask & is_trans
+        ta = accuracy_score(y_te[tm], pred[tm]) if tm.sum() > 0 else 0
+        rows.append({'min_conf': t, 'n_blocks': int(mask.sum()),
+                     'pct': round(mask.mean()*100, 1),
+                     'acc': round(a*100, 1),
+                     'trans_acc': round(ta*100, 1)})
+    conf_df = pd.DataFrame(rows)
+    print(conf_df.to_string(index=False))
+
+    # Monthly accuracy
+    print("\n  " + "=" * 60)
+    print("  MONTHLY ACCURACY")
+    print("  " + "=" * 60)
+    res = df[te][['date', 'block', 'regime']].copy()
+    res['actual_next'] = y_te_labels
+    res['pred_next'] = pred_labels
+    res['confidence'] = conf.round(3)
+    res['correct'] = (pred_labels == y_te_labels)
+    res['is_transition'] = (res['regime'] != res['actual_next'])
+    monthly = res.assign(month=res['date'].str[:7]).groupby('month').correct.agg(['mean', 'count'])
+    monthly.columns = ['accuracy', 'n']
+    monthly['accuracy'] = (monthly['accuracy'] * 100).round(1)
+    for m, row in monthly.iterrows():
+        bar = '#' * int(row.accuracy / 2)
+        print(f"    {m}  {row.accuracy:5.1f}%  n={int(row.n):3d}  {bar}")
+
+    # Save
+    res.to_csv(OUT / "predictions.csv", index=False)
+    cm_df.to_csv(OUT / "confusion_matrix.csv")
+    conf_df.to_csv(OUT / "confidence_calibration.csv", index=False)
+    monthly.to_csv(OUT / "monthly_accuracy.csv")
+
+    json.dump({
+        'split_date': SPLIT_DATE, 'test_end': TEST_END,
+        'n_in': int(tr.sum()), 'n_out': int(te.sum()),
+        'n_features': len(feat_cols),
+        'insample_acc': round(float(acc_in), 4),
+        'outsample_acc': round(float(acc), 4),
+        'outsample_balanced_acc': round(float(bal), 4),
+        'outsample_f1': round(float(f1), 4),
+        'outsample_logloss': round(float(ll), 4),
+        'per_class_auc': {k: round(float(v), 4) for k, v in aucs.items()},
+        'overfit_gap': round(float(acc_in - acc), 4),
+        'persistence_baseline': round(float(persist), 4),
+        'majority_baseline': round(float(majority), 4),
+        'markov_baseline': round(float(markov), 4),
+        'lift_over_majority': round(float(acc - majority), 4),
+        'lift_over_markov': round(float(acc - markov), 4),
+        'lift_over_persistence': round(float(acc - persist), 4),
+        'raw_acc': round(float(raw_acc), 4),
+        'filtered_acc': round(float(filt_acc), 4),
+        'filter_active': bool(CFG['use_filter']),
+        'transition_metrics': trans_metrics,
+        'per_class': classification_report(y_te_labels, pred_labels, labels=REGIMES,
+                                            zero_division=0, output_dict=True),
+    }, open(OUT / "metrics.json", "w"), indent=2)
+
+    # Plots
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=REGIMES, yticklabels=REGIMES, ax=ax)
+    ax.set_xlabel("Predicted next"); ax.set_ylabel("Actual next")
+    ax.set_title(f"Out-of-Sample -- {acc*100:.1f}%", fontweight="bold")
+    plt.tight_layout(); plt.savefig(OUT / "confusion_matrix.png", dpi=150); plt.close()
+
+    if is_trans.sum() > 0:
+        cm_t = confusion_matrix(y_te_labels[is_trans], pred_labels[is_trans], labels=REGIMES)
+        acc_t = accuracy_score(y_te_labels[is_trans], pred_labels[is_trans])
+        fig, ax = plt.subplots(figsize=(7, 6))
+        sns.heatmap(cm_t, annot=True, fmt="d", cmap="Oranges",
+                    xticklabels=REGIMES, yticklabels=REGIMES, ax=ax)
+        ax.set_xlabel("Predicted next"); ax.set_ylabel("Actual next")
+        ax.set_title(f"Transitions only -- {acc_t*100:.1f}%", fontweight="bold")
+        plt.tight_layout(); plt.savefig(OUT / "confusion_matrix_transitions.png", dpi=150); plt.close()
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(monthly.index, monthly['accuracy'], color='#3B82F6', alpha=0.8)
+    ax.axhline(acc*100, ls='--', color='#EF4444', label=f'overall {acc*100:.1f}%')
+    ax.axhline(persist*100, ls=':', color='#64748B', label=f'persistence {persist*100:.1f}%')
+    ax.set_ylabel("Accuracy %"); ax.set_ylim(0, 60)
+    ax.set_title("Monthly Out-of-Sample Accuracy", fontweight="bold")
+    plt.xticks(rotation=45); ax.legend(); ax.grid(alpha=0.3, axis='y')
+    plt.tight_layout(); plt.savefig(OUT / "monthly_accuracy.png", dpi=150); plt.close()
+
+    print(f"\n  Saved -> {OUT}/")
+    print("=" * 68)
+
+
+if __name__ == "__main__":
+    main()
